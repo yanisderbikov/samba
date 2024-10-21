@@ -916,84 +916,85 @@ static int streams_xattr_connect(vfs_handle_struct *handle,
 }
 
 static ssize_t streams_xattr_pwrite(vfs_handle_struct *handle,
-				    files_struct *fsp, const void *data,
-				    size_t n, off_t offset)
-{
-        struct stream_io *sio =
-		(struct stream_io *)VFS_FETCH_FSP_EXTENSION(handle, fsp);
-	struct ea_struct ea;
-	NTSTATUS status;
-	int ret;
+                                    files_struct *fsp, const void *data,
+                                    size_t n, off_t offset) {
+    struct stream_io *sio =
+        (struct stream_io *)VFS_FETCH_FSP_EXTENSION(handle, fsp);
+    struct ea_struct ea;
+    NTSTATUS status;
+    int ret;
 
-	DEBUG(10, ("streams_xattr_pwrite called for %d bytes\n", (int)n));
+    DEBUG(10, ("streams_xattr_pwrite called for %d bytes\n", (int)n));
 
-	if (sio == NULL) {
-		return SMB_VFS_NEXT_PWRITE(handle, fsp, data, n, offset);
-	}
+    if (sio == NULL) {
+        return SMB_VFS_NEXT_PWRITE(handle, fsp, data, n, offset);
+    }
 
-	if (!streams_xattr_recheck(sio)) {
-		return -1;
-	}
+    if (!streams_xattr_recheck(sio)) {
+        return -1;
+    }
 
-	if ((offset + n) >= lp_smbd_max_xattr_size(SNUM(handle->conn))) {
-		/*
-		 * Requested write is beyond what can be read based on
-		 * samba configuration.
-		 * ReFS returns STATUS_FILESYSTEM_LIMITATION, which causes
-		 * entire file to be skipped by File Explorer. VFAT returns
-		 * NT_STATUS_OBJECT_NAME_COLLISION causes user to be prompted
-		 * to skip writing metadata, but copy data.
-		 */
-		DBG_ERR("Write to xattr [%s] on file [%s] exceeds maximum "
-			"supported extended attribute size. "
-			"Depending on filesystem type and operating system "
-			"(OS) specifics, this value may be increased using "
-			"the value of the parameter: "
-			"smbd max xattr size = <bytes>. Consult OS and "
-			"filesystem manpages prior to increasing this limit.\n",
-			sio->xattr_name, sio->base);
-		errno = EOVERFLOW;
-		return -1;
-	}
+    status = get_ea_value_fsp(talloc_tos(),
+                              fsp->base_fsp,
+                              sio->xattr_name,
+                              &ea);
 
-	status = get_ea_value_fsp(talloc_tos(),
-				  fsp->base_fsp,
-				  sio->xattr_name,
-				  &ea);
-	if (!NT_STATUS_IS_OK(status)) {
-		return -1;
-	}
-
-        if ((offset + n) > ea.value.length-1) {
-		uint8_t *tmp;
-
-		tmp = talloc_realloc(talloc_tos(), ea.value.data, uint8_t,
-					   offset + n + 1);
-
-		if (tmp == NULL) {
-			TALLOC_FREE(ea.value.data);
-                        errno = ENOMEM;
-                        return -1;
-                }
-		ea.value.data = tmp;
-		ea.value.length = offset + n + 1;
-		ea.value.data[offset+n] = 0;
+    if (!NT_STATUS_IS_OK(status)) {
+        // Если атрибут не найден, создадим пустой
+        if (NT_STATUS_EQUAL(status, NT_STATUS_NOT_FOUND)) {
+            char null = '\0';
+            DEBUG(10, ("Creating new xattr %s for file %s\n",
+                       sio->xattr_name, sio->base));
+            ret = SMB_VFS_FSETXATTR(fsp->base_fsp,
+                                    sio->xattr_name,
+                                    &null, sizeof(null),
+                                    0);
+            if (ret != 0) {
+                return -1;
+            }
+            // Попробуем снова получить значение
+            status = get_ea_value_fsp(talloc_tos(),
+                                      fsp->base_fsp,
+                                      sio->xattr_name,
+                                      &ea);
+            if (!NT_STATUS_IS_OK(status)) {
+                return -1;
+            }
+        } else {
+            return -1;
         }
+    }
 
-        memcpy(ea.value.data + offset, data, n);
+    if ((offset + n) > ea.value.length - 1) {
+        uint8_t *tmp;
 
-	ret = SMB_VFS_FSETXATTR(fsp->base_fsp,
-				sio->xattr_name,
-				ea.value.data,
-				ea.value.length,
-				0);
-	TALLOC_FREE(ea.value.data);
+        tmp = talloc_realloc(talloc_tos(), ea.value.data, uint8_t,
+                             offset + n + 1);
 
-	if (ret == -1) {
-		return -1;
-	}
+        if (tmp == NULL) {
+            TALLOC_FREE(ea.value.data);
+            errno = ENOMEM;
+            return -1;
+        }
+        ea.value.data = tmp;
+        ea.value.length = offset + n + 1;
+        ea.value.data[offset + n] = 0;
+    }
 
-	return n;
+    memcpy(ea.value.data + offset, data, n);
+
+    ret = SMB_VFS_FSETXATTR(fsp->base_fsp,
+                            sio->xattr_name,
+                            ea.value.data,
+                            ea.value.length,
+                            0);
+    TALLOC_FREE(ea.value.data);
+
+    if (ret == -1) {
+        return -1;
+    }
+
+    return n;
 }
 
 static ssize_t streams_xattr_pread(vfs_handle_struct *handle,
